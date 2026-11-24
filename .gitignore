@@ -1,0 +1,18 @@
+# Environment variables
+.env
+.env.*
+
+# Allow example environment file
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

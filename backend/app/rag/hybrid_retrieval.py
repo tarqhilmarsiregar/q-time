@@ -11,6 +11,15 @@ from app.rag.calendar_retrieval import (
 
 from app.rag.retrieval import retrieve_documents
 
+from app.rag.config import (
+    SEMANTIC_EXCLUDED_CATEGORIES,
+    SEMANTIC_MIN_SIMILARITY,
+)
+
+
+# ==========================================
+# LOGGING CONFIGURATION
+# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +30,76 @@ logger = logging.getLogger(__name__)
 
 
 # ==========================================
-# 1. HYBRID RETRIEVAL ENGINE
+# 1. SEMANTIC RETRIEVAL GOVERNANCE
+# ==========================================
+
+def filter_trusted_semantic_results(documents):
+    """
+    Apply application-level governance to semantic results.
+
+    Rules:
+    1. Exclude restricted document categories.
+    2. Reject results without a valid similarity score.
+    3. Reject results below the configured threshold.
+
+    Published document filtering is enforced separately
+    inside retrieve_documents().
+    """
+
+    trusted_documents = []
+
+    excluded_categories = {
+        category.strip().lower()
+        for category in SEMANTIC_EXCLUDED_CATEGORIES
+        if isinstance(category, str) and category.strip()
+    }
+
+    for document in documents:
+
+        # ----------------------------------
+        # Check document category
+        # ----------------------------------
+
+        category = str(
+            document.get("category") or ""
+        ).strip().lower()
+
+        if category in excluded_categories:
+            logger.warning(
+                "Excluded restricted category: %s",
+                category
+            )
+            continue
+
+        # ----------------------------------
+        # Check similarity score
+        # ----------------------------------
+
+        try:
+            similarity = float(
+                document["similarity"]
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning(
+                "Document rejected: invalid similarity score."
+            )
+            continue
+
+        if similarity < SEMANTIC_MIN_SIMILARITY:
+            logger.info(
+                "Document rejected: similarity %.6f is below %.6f",
+                similarity,
+                SEMANTIC_MIN_SIMILARITY
+            )
+            continue
+
+        trusted_documents.append(document)
+
+    return trusted_documents
+
+
+# ==========================================
+# 2. HYBRID RETRIEVAL ENGINE
 # ==========================================
 
 def hybrid_retrieve(
@@ -31,18 +109,26 @@ def hybrid_retrieve(
     academic_year_override: str | None = None
 ):
     """
-    Route a user query to either:
+    Route an academic question to either:
 
     1. Structured SQL retrieval.
     2. Semantic vector retrieval.
 
-    The router currently uses deterministic rules.
+    Governance:
+    - Preview only affects structured calendar retrieval.
+    - Semantic retrieval only uses published documents.
+    - Restricted categories are excluded.
+    - Similarity threshold is enforced.
     """
 
-    if not query or not query.strip():
+    # --------------------------------------
+    # Validate input
+    # --------------------------------------
+
+    if not isinstance(query, str) or not query.strip():
         raise ValueError("Query cannot be empty.")
 
-    if top_k < 1 or top_k > 20:
+    if not isinstance(top_k, int) or not 1 <= top_k <= 20:
         raise ValueError("top_k must be between 1 and 20.")
 
     # --------------------------------------
@@ -51,90 +137,168 @@ def hybrid_retrieve(
 
     route_info = classify_query(query)
 
+    route = route_info["route"]
+
+    if route not in ("structured", "semantic"):
+        raise ValueError(
+            f"Unsupported query route: {route}"
+        )
+
     academic_year = (
         academic_year_override
-        or route_info["academic_year"]
+        or route_info.get("academic_year")
     )
 
-    logger.info(
-        "Query route: %s",
-        route_info["route"]
-    )
+    semester = route_info.get("semester")
 
+    # --------------------------------------
+    # Normalize event information
+    # --------------------------------------
+
+    # Current query_router.py returns:
+    # event_keyword and event_category.
+
+    event_keyword = route_info.get("event_keyword")
+    event_category = route_info.get("event_category")
+
+    # Backward compatibility:
+    # Support older router versions that return
+    # an event dictionary.
+
+    legacy_event = route_info.get("event")
+
+    if isinstance(legacy_event, dict):
+
+        if event_keyword is None:
+            event_keyword = legacy_event.get("keyword")
+
+        if event_category is None:
+            event_category = legacy_event.get("category")
+
+    event = None
+
+    if event_keyword or event_category:
+
+        event = {
+            "keyword": event_keyword,
+            "category": event_category
+        }
+
+    logger.info("Query route: %s", route)
     logger.info(
         "Routing reason: %s",
-        route_info["reason"]
+        route_info.get("reason", "Not specified")
     )
 
-    # --------------------------------------
+    # ======================================
     # STRUCTURED RETRIEVAL
-    # --------------------------------------
+    # ======================================
 
-    if route_info["route"] == "structured":
+    if route == "structured":
 
-        event = route_info["event"]
+        logger.info(
+            "Structured retrieval preview: %s",
+            include_review
+        )
 
         results = retrieve_academic_events(
             academic_year=academic_year,
 
-            event_keyword=(
-                event["keyword"]
-                if event else None
-            ),
+            event_keyword=event_keyword,
 
-            semester=route_info["semester"],
+            semester=semester,
 
-            event_category=(
-                event["category"]
-                if event else None
-            ),
+            event_category=event_category,
 
             include_review=include_review,
 
             limit=(
-                20 if event is None else top_k
+                20 if event_keyword is None else top_k
             )
         )
 
         return {
             "route": "structured",
             "query": query,
-            "reason": route_info["reason"],
+            "reason": route_info.get("reason"),
             "academic_year": academic_year,
-            "semester": route_info["semester"],
+            "semester": semester,
             "event": event,
-            "results": results
+            "results": results,
+            "preview": include_review
         }
 
-    # --------------------------------------
+    # ======================================
     # SEMANTIC RETRIEVAL
-    # --------------------------------------
+    # ======================================
 
-    results = retrieve_documents(
+    logger.info(
+        "Semantic minimum similarity: %.2f",
+        SEMANTIC_MIN_SIMILARITY
+    )
+
+    logger.info(
+        "Excluded document categories: %s",
+        SEMANTIC_EXCLUDED_CATEGORIES
+    )
+
+    # Retrieve only published documents.
+    # Category exclusions are applied in SQL
+    # through retrieve_documents().
+
+    documents = retrieve_documents(
         query=query,
         top_k=top_k,
-        category=None
+        category=None,
+        academic_year=None,
+        exclude_categories=SEMANTIC_EXCLUDED_CATEGORIES
+    )
+
+    # Apply an additional application-level filter.
+
+    trusted_documents = filter_trusted_semantic_results(
+        documents
+    )
+
+    logger.info(
+        "Semantic chunks retrieved: %d",
+        len(documents)
+    )
+
+    logger.info(
+        "Trusted semantic chunks: %d",
+        len(trusted_documents)
     )
 
     return {
         "route": "semantic",
         "query": query,
-        "reason": route_info["reason"],
+        "reason": route_info.get("reason"),
         "academic_year": academic_year,
-        "semester": route_info["semester"],
+        "semester": semester,
         "event": None,
-        "results": results
+        "results": trusted_documents,
+        "preview": False,
+        "semantic_min_similarity": SEMANTIC_MIN_SIMILARITY
     }
 
 
 # ==========================================
-# 2. DISPLAY STRUCTURED RESULTS
+# 3. DISPLAY STRUCTURED RESULTS
 # ==========================================
 
-def display_structured_results(results):
+def display_structured_results(results, preview=False):
 
     if not results:
+
         print("\nTidak ditemukan kegiatan akademik.")
+
+        if not preview:
+            print(
+                "Data yang belum berstatus published "
+                "tidak ditampilkan."
+            )
+
         return
 
     print("\nSTRUCTURED RETRIEVAL RESULTS")
@@ -163,13 +327,23 @@ def display_structured_results(results):
 
 
 # ==========================================
-# 3. DISPLAY SEMANTIC RESULTS
+# 4. DISPLAY SEMANTIC RESULTS
 # ==========================================
 
 def display_semantic_results(results):
 
     if not results:
-        print("\nTidak ditemukan potongan dokumen.")
+
+        print(
+            "\nTidak ditemukan sumber pengetahuan "
+            "yang terverifikasi dan cukup relevan."
+        )
+
+        print(
+            "Sistem tidak akan menyusun jawaban "
+            "berdasarkan sumber yang tidak tersedia."
+        )
+
         return
 
     print("\nSEMANTIC RETRIEVAL RESULTS")
@@ -185,19 +359,18 @@ def display_semantic_results(results):
         print(f"Page       : {result['page_number']}")
 
         print(
-            f"Similarity : "
-            f"{result['similarity']:.6f}"
+            f"Similarity : {result['similarity']:.6f}"
         )
 
         print("\nCONTENT:")
         print(result["content"])
 
     print("\n" + "=" * 65)
-    print(f"Total chunks found: {len(results)}")
+    print(f"Total trusted chunks: {len(results)}")
 
 
 # ==========================================
-# 4. RESULT DISPLAY
+# 5. RESULT DISPLAY
 # ==========================================
 
 def display_hybrid_result(response):
@@ -208,28 +381,43 @@ def display_hybrid_result(response):
     print("=" * 65)
 
     print(f"\nQuestion : {response['query']}")
-
     print(f"Route    : {response['route']}")
-
     print(f"Reason   : {response['reason']}")
 
-    if response["academic_year"]:
+    if response.get("academic_year"):
         print(
             f"Academic Year : {response['academic_year']}"
         )
 
-    if response["semester"]:
+    if response.get("semester"):
         print(
             f"Semester      : {response['semester']}"
         )
 
     if response["route"] == "structured":
 
+        print(
+            "Mode          : "
+            + (
+                "PREVIEW"
+                if response["preview"]
+                else "PUBLISHED ONLY"
+            )
+        )
+
         display_structured_results(
-            response["results"]
+            response["results"],
+            preview=response["preview"]
         )
 
     else:
+
+        print("Mode          : PUBLISHED DOCUMENTS ONLY")
+
+        print(
+            "Minimum Similarity: "
+            f"{response['semantic_min_similarity']:.2f}"
+        )
 
         display_semantic_results(
             response["results"]
@@ -237,7 +425,7 @@ def display_hybrid_result(response):
 
 
 # ==========================================
-# 5. CLI TESTING
+# 6. CLI TESTING
 # ==========================================
 
 def main():
@@ -272,6 +460,9 @@ def main():
 
     args = parser.parse_args()
 
+    if not 1 <= args.top_k <= 20:
+        parser.error("--top-k must be between 1 and 20.")
+
     def run_query(query):
 
         try:
@@ -291,22 +482,32 @@ def main():
                 "Hybrid retrieval failed."
             )
 
+    # --------------------------------------
     # Single-query mode
+    # --------------------------------------
+
     if args.query:
 
         run_query(args.query)
-
         return
 
+    # --------------------------------------
     # Interactive mode
+    # --------------------------------------
+
     print("\nSTMIK ACADEMIC COPILOT")
     print("HYBRID RETRIEVAL TESTING")
 
-    print("\nMode:")
+    print("\nPreview setting:")
     print(
-        "PREVIEW - includes needs_review"
+        "ON - affects Structured Retrieval only"
         if args.preview
-        else "PUBLISHED ONLY"
+        else "OFF - published events only"
+    )
+
+    print(
+        "Semantic Retrieval always uses published "
+        "documents and governance filters."
     )
 
     print("\nKetik 'exit' untuk berhenti.")
@@ -320,10 +521,12 @@ def main():
         ).strip()
 
         if query.casefold() in ["exit", "quit"]:
+
             print("\nTesting selesai.")
             break
 
         if not query:
+
             print("Pertanyaan tidak boleh kosong.")
             continue
 

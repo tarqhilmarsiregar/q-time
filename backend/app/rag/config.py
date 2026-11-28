@@ -55,3 +55,22 @@ DEFAULT_ACADEMIC_YEAR = os.getenv(
     "DEFAULT_ACADEMIC_YEAR",
     "2026/2027"
 )
+
+
+SEMANTIC_EXCLUDED_CATEGORIES = tuple(
+    category.strip().lower()
+    for category in os.getenv(
+        "SEMANTIC_EXCLUDED_CATEGORIES",
+        "academic-calendar",
+    ).split(",")
+    if category.strip()
+)
+
+SEMANTIC_MIN_SIMILARITY = float(
+    os.getenv("SEMANTIC_MIN_SIMILARITY", "0.70")
+)
+
+if not 0.0 <= SEMANTIC_MIN_SIMILARITY <= 1.0:
+    raise ValueError(
+        "SEMANTIC_MIN_SIMILARITY must be between 0 and 1"
+    )

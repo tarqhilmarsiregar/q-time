@@ -12,9 +12,10 @@ from app.rag.config import TOP_K
 
 def retrieve_documents(
     query: str,
-    top_k: int = TOP_K,
-    category: str | None = None,
-    academic_year: str | None = None
+    top_k=TOP_K,
+    category=None,
+    academic_year=None,
+    exclude_categories=None,
 ):
     """
     Retrieve published academic document chunks
@@ -33,6 +34,9 @@ def retrieve_documents(
 
     academic_year : str | None
         Optional academic year filter.
+
+    exclude_categories : list[str] | None
+        Document categories excluded from retrieval.
 
     Returns
     -------
@@ -66,17 +70,50 @@ def retrieve_documents(
         "d.status = %s"
     ]
 
-    # The first vector belongs to SELECT distance.
+    # First vector belongs to SELECT distance.
     params = [vector, "published"]
 
+    # Optional category filter
     if category:
         conditions.append("d.category = %s")
         params.append(category)
 
+    # Optional academic year filter
     if academic_year:
         conditions.append("d.academic_year = %s")
         params.append(academic_year)
 
+    # --------------------------------------
+    # RETRIEVAL GOVERNANCE
+    # Exclude restricted document categories
+    # --------------------------------------
+
+    if isinstance(exclude_categories, str):
+        excluded = (
+            [exclude_categories.strip().lower()]
+            if exclude_categories.strip()
+            else []
+        )
+    else:
+        excluded = [
+            value.strip().lower()
+            for value in (exclude_categories or [])
+            if isinstance(value, str) and value.strip()
+        ]
+
+    if excluded:
+        placeholders = ", ".join(
+            ["%s"] * len(excluded)
+        )
+
+        conditions.append(
+            "LOWER(COALESCE(d.category, '')) "
+            f"NOT IN ({placeholders})"
+        )
+
+        params.extend(excluded)
+
+    # Combine all WHERE conditions
     where_clause = " AND ".join(conditions)
 
     # --------------------------------------

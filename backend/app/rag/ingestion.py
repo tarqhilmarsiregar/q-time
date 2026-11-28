@@ -9,12 +9,15 @@ from pathlib import Path
 
 import pymupdf
 
+import numpy as np
+
 from pgvector import Vector
 from psycopg.types.json import Jsonb
 
 from app.rag.config import (
     CHUNK_SIZE,
     CHUNK_OVERLAP,
+    EMBEDDING_DIMENSION,
 )
 
 from app.rag.database import get_connection
@@ -85,59 +88,70 @@ def extract_pdf_pages(pdf_path: Path):
 def chunk_text(
     text: str,
     chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP
-):
+    overlap: int = CHUNK_OVERLAP,
+) -> list[str]:
     """
-    Split text into overlapping character chunks.
+    Split text into overlapping chunks without splitting words.
+
+    Chunk size and overlap are measured in characters.
     """
 
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return []
+
     if chunk_size <= 0:
-        raise ValueError("chunk_size must be positive.")
+        raise ValueError("chunk_size must be greater than zero.")
 
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError(
-            "overlap must be >= 0 and smaller than chunk_size."
+            "overlap must be greater than or equal to zero "
+            "and smaller than chunk_size."
         )
-
-    # Normalize unnecessary whitespace
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     chunks = []
     start = 0
+    text_length = len(text)
 
-    while start < len(text):
+    while start < text_length:
 
-        end = min(
-            start + chunk_size,
-            len(text)
-        )
+        target_end = min(start + chunk_size, text_length)
 
-        # Try to split at a whitespace boundary
-        if end < len(text):
+        # Find a whitespace boundary near the target end.
+        if target_end < text_length:
+            min_boundary = start + int(chunk_size * 0.7)
 
             boundary = text.rfind(
                 " ",
-                start + int(chunk_size * 0.7),
-                end
+                min_boundary,
+                target_end,
             )
 
-            if boundary > start:
-                end = boundary
+            end = boundary if boundary > start else target_end
 
-        content = text[start:end].strip()
+        else:
+            end = target_end
 
-        if content:
-            chunks.append(content)
+        chunk = text[start:end].strip()
 
-        if end >= len(text):
+        if chunk:
+            chunks.append(chunk)
+
+        if end >= text_length:
             break
 
-        # Maintain a small overlap between chunks
-        start = max(
-            end - overlap,
-            start + 1
-        )
+        # Calculate the next starting position using overlap.
+        next_start = max(end - overlap, start + 1)
+
+        # Move forward until the next complete word boundary.
+        while next_start < text_length and text[next_start] != " ":
+            next_start += 1
+
+        if next_start >= text_length:
+            break
+
+        start = next_start + 1
 
     return chunks
 
@@ -189,6 +203,250 @@ def calculate_sha256(file_path: Path):
 
     return sha256.hexdigest()
 
+
+# ==========================================
+# DOCUMENT METADATA VALIDATION
+# ==========================================
+
+def validate_document_metadata(args, file_path):
+
+    title = file_path.stem.replace(
+        "_", " "
+    ).title()
+
+    file_name = file_path.name
+    category = args.category
+    academic_year = args.academic_year
+    version = args.version
+    status = args.status
+
+    if not title.strip():
+        raise ValueError("Document title cannot be empty.")
+
+    if len(title) > 255:
+        raise ValueError(
+            "Document title exceeds 255 characters."
+        )
+
+    if len(file_name) > 255:
+        raise ValueError(
+            "File name exceeds 255 characters."
+        )
+
+    if not category or not category.strip():
+        raise ValueError(
+            "Document category cannot be empty."
+        )
+
+    if len(category) > 100:
+        raise ValueError(
+            "Document category exceeds 100 characters."
+        )
+
+    if academic_year and len(academic_year) > 20:
+        raise ValueError(
+            "Academic year exceeds 20 characters."
+        )
+
+    if version and len(version) > 50:
+        raise ValueError(
+            "Document version exceeds 50 characters."
+        )
+
+    if status not in ["draft", "published"]:
+        raise ValueError(
+            "Invalid document status."
+        )
+
+    logger.info(
+        "Document metadata validation successful."
+    )
+
+def validate_document_metadata(args, file_path: Path) -> date | None:
+    """
+    Validate and normalize document metadata
+    before ingestion and database persistence.
+
+    Validation follows the documents table schema.
+    """
+
+    errors = []
+
+    # Generate metadata derived from the PDF file.
+    title = file_path.stem.replace("_", " ").title()
+    file_name = file_path.name
+
+    # Normalize optional and required metadata.
+    args.category = (args.category or "").strip()
+    args.academic_year = (
+        args.academic_year.strip()
+        if args.academic_year and args.academic_year.strip()
+        else None
+    )
+    args.version = (
+        args.version.strip()
+        if args.version and args.version.strip()
+        else None
+    )
+    args.status = (args.status or "").strip().lower()
+
+    # Validate required text fields.
+    if not title:
+        errors.append("Document title cannot be empty.")
+
+    if not file_name:
+        errors.append("File name cannot be empty.")
+
+    if not args.category:
+        errors.append("Document category cannot be empty.")
+
+    # Validate VARCHAR length constraints.
+    if len(title) > 255:
+        errors.append(
+            f"Title exceeds 255 characters: {len(title)}."
+        )
+
+    if len(file_name) > 255:
+        errors.append(
+            f"File name exceeds 255 characters: {len(file_name)}."
+        )
+
+    if len(args.category) > 100:
+        errors.append(
+            f"Category exceeds 100 characters: {len(args.category)}."
+        )
+
+    if args.academic_year and len(args.academic_year) > 20:
+        errors.append(
+            "Academic year exceeds 20 characters."
+        )
+
+    if args.version and len(args.version) > 50:
+        errors.append(
+            "Version exceeds 50 characters."
+        )
+
+    # Validate document status.
+    allowed_statuses = {"draft", "published"}
+
+    if args.status not in allowed_statuses:
+        errors.append(
+            f"Invalid document status: {args.status}. "
+            f"Allowed values: {', '.join(sorted(allowed_statuses))}."
+        )
+
+    # Validate effective date.
+    effective_date = None
+
+    if args.effective_date:
+        try:
+            effective_date = date.fromisoformat(
+                args.effective_date
+            )
+        except ValueError:
+            errors.append(
+                "Invalid effective date. "
+                "Expected format: YYYY-MM-DD."
+            )
+
+    # Raise all validation errors together.
+    if errors:
+        error_message = "\n".join(
+            f"- {error}" for error in errors
+        )
+
+        raise ValueError(
+            f"Document metadata validation failed:\n{error_message}"
+        )
+
+    logger.info("Document metadata validation passed.")
+
+    return effective_date
+
+def validate_embeddings(
+    embeddings,
+    expected_count: int,
+    expected_dimension: int = EMBEDDING_DIMENSION,
+) -> np.ndarray:
+    """
+    Validate generated embedding vectors before persistence.
+
+    Checks:
+    1. Embedding count matches the number of chunks.
+    2. Embedding dimension matches the configured dimension.
+    3. All values are finite.
+    4. No embedding vector is a zero vector.
+    """
+
+    if expected_count <= 0:
+        raise ValueError(
+            "Expected embedding count must be greater than zero."
+        )
+
+    if expected_dimension <= 0:
+        raise ValueError(
+            "Expected embedding dimension must be greater than zero."
+        )
+
+    try:
+        vectors = np.asarray(
+            embeddings,
+            dtype=np.float32,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Embeddings cannot be converted into a numeric array."
+        ) from exc
+
+    # Check array structure.
+    if vectors.ndim != 2:
+        raise ValueError(
+            "Invalid embedding structure. "
+            f"Expected a 2D array, received {vectors.ndim}D."
+        )
+
+    actual_count, actual_dimension = vectors.shape
+
+    # Check embedding count.
+    if actual_count != expected_count:
+        raise ValueError(
+            "Embedding count mismatch. "
+            f"Expected {expected_count}, received {actual_count}."
+        )
+
+    # Check embedding dimension.
+    if actual_dimension != expected_dimension:
+        raise ValueError(
+            "Embedding dimension mismatch. "
+            f"Expected {expected_dimension}, "
+            f"received {actual_dimension}."
+        )
+
+    # Check NaN and Infinity.
+    if not np.isfinite(vectors).all():
+        raise ValueError(
+            "Embeddings contain NaN or Infinity values."
+        )
+
+    # Check zero vectors.
+    vector_norms = np.linalg.norm(
+        vectors,
+        axis=1,
+    )
+
+    if np.any(vector_norms == 0):
+        raise ValueError(
+            "Embeddings contain zero vectors."
+        )
+
+    logger.info(
+        "Embedding validation passed. "
+        "Count: %s, Dimension: %s",
+        actual_count,
+        actual_dimension,
+    )
+
+    return vectors
 
 # ==========================================
 # 5. DATABASE STORAGE
@@ -324,6 +582,12 @@ def ingest_document(args):
             "Only PDF documents are supported."
         )
 
+    # Validate document metadata before processing.
+    effective_date = validate_document_metadata(
+        args,
+        file_path,
+    )
+
     logger.info(
         "Starting ingestion: %s",
         file_path.name
@@ -345,7 +609,7 @@ def ingest_document(args):
         len(chunks)
     )
 
-    # Generate vector representations
+        # Generate vector representations.
     texts = [
         chunk["content"]
         for chunk in chunks
@@ -353,8 +617,16 @@ def ingest_document(args):
 
     vectors = embed_passages(texts)
 
+    # Validate embeddings before database persistence.
+    vectors = validate_embeddings(
+        embeddings=vectors,
+        expected_count=len(chunks),
+    )
+
     logger.info(
-        "Embedding generation completed."
+        "Embedding generation completed: %s vectors, dimension %s.",
+        len(vectors),
+        EMBEDDING_DIMENSION,
     )
 
     effective_date = (
